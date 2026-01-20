@@ -23,6 +23,12 @@
  * questions.
  */
 
+/*
+ * ===========================================================================
+ * (c) Copyright IBM Corp. 2025, 2026 All Rights Reserved
+ * ===========================================================================
+ */
+
 package sun.nio.ch;
 
 import java.io.FileDescriptor;
@@ -443,6 +449,18 @@ class ServerSocketChannelImpl
         } finally {
             acceptLock.unlock();
         }
+    }
+
+    /**
+     * This method is added to support the pollset implementation.
+     * Translates an interest operation set into a native poll event set.
+     */
+    @Override
+    public void translateAndSetInterestOps(int ops, SelectionKeyImpl sk) {
+        // Translate ops
+        int newOps = ((ops & SelectionKey.OP_ACCEPT) != 0) ? Net.POLLIN : 0;
+        // Place ops into pollfd array
+        ((SelectorImpl) sk.selector()).putEventOps(sk, newOps);
     }
 
     /**

@@ -23,6 +23,12 @@
  * questions.
  */
 
+/*
+ * ===========================================================================
+ * (c) Copyright IBM Corp. 2025, 2025 All Rights Reserved
+ * ===========================================================================
+ */
+
 package sun.nio.ch;
 
 import java.io.FileDescriptor;
@@ -56,6 +62,8 @@ import sun.net.NetHooks;
 import sun.net.ext.ExtendedSocketOptions;
 import sun.net.util.SocketExceptions;
 import static sun.net.ext.ExtendedSocketOptions.SOCK_STREAM;
+
+import sun.nio.ch.PollsetSelectorFeature;
 
 /**
  * An implementation of SocketChannels
@@ -107,6 +115,9 @@ class SocketChannelImpl
     // Binding
     private InetSocketAddress localAddress;
     private InetSocketAddress remoteAddress;
+
+    // This variable is added to support the pollset implementation.
+    private boolean readyToConnect;
 
     // Socket adaptor, created on demand
     private Socket socket;
@@ -534,6 +545,10 @@ class SocketChannelImpl
 
     @Override
     protected void implConfigureBlocking(boolean block) throws IOException {
+        if (PollsetSelectorFeature.ENABLED) {
+            IOUtil.configureBlocking(fd, block);
+            return;
+        }
         readLock.lock();
         try {
             writeLock.lock();
@@ -668,8 +683,104 @@ class SocketChannelImpl
         }
     }
 
+    // This method is added to support the pollset implementation.
+    private void readerCleanup() throws IOException {
+        synchronized (stateLock) {
+            readerThread = 0;
+            if (state == ST_KILLPENDING)
+                kill();
+        }
+    }
+
+    // This method is added to support the pollset implementation.
+    void ensureOpenAndUnconnected() throws IOException { // package-private
+        synchronized (stateLock) {
+            if (!isOpen())
+                throw new ClosedChannelException();
+            if (state == ST_CONNECTED)
+                throw new AlreadyConnectedException();
+            if (state == ST_CONNECTIONPENDING)
+                throw new ConnectionPendingException();
+        }
+    }
+
     @Override
     public boolean connect(SocketAddress sa) throws IOException {
+        if (PollsetSelectorFeature.ENABLED) {
+            int localPort = 0;
+
+            synchronized (readLock) {
+                synchronized (writeLock) {
+                    ensureOpenAndUnconnected();
+                    InetSocketAddress isa = Net.checkAddress(sa);
+                    SecurityManager sm = System.getSecurityManager();
+                    if (sm != null)
+                        sm.checkConnect(isa.getAddress().getHostAddress(),
+                                        isa.getPort());
+                    synchronized (blockingLock()) {
+                        int n = 0;
+                        try {
+                            try {
+                                begin();
+                                synchronized (stateLock) {
+                                    if (!isOpen()) {
+                                        return false;
+                                    }
+                                    // notify hook only if unbound
+                                    if (localAddress == null) {
+                                        NetHooks.beforeTcpConnect(fd,
+                                                                  isa.getAddress(),
+                                                                  isa.getPort());
+                                    }
+                                    readerThread = NativeThread.current();
+                                }
+                                for (;;) {
+                                    InetAddress ia = isa.getAddress();
+                                    if (ia.isAnyLocalAddress())
+                                        ia = InetAddress.getLocalHost();
+                                    n = Net.connect(fd,
+                                                    ia,
+                                                    isa.getPort());
+                                    if ((n == IOStatus.INTERRUPTED)
+                                          && isOpen())
+                                        continue;
+                                    break;
+                                }
+                            } finally {
+                                readerCleanup();
+                                end((n > 0) || (n == IOStatus.UNAVAILABLE));
+                                assert IOStatus.check(n);
+                            }
+                        } catch (IOException x) {
+                            // If an exception was thrown, close the channel after
+                            // invoking end() so as to avoid bogus
+                            // AsynchronousCloseExceptions
+                            close();
+                            throw x;
+                        }
+                        synchronized (stateLock) {
+                            remoteAddress = isa;
+                            if (n > 0) {
+                                // Connection succeeded; disallow further
+                                // invocation
+                                state = ST_CONNECTED;
+                                if (isOpen())
+                                    localAddress = Net.localAddress(fd);
+                                return true;
+                            }
+                            // If nonblocking and no exception then connection
+                            // pending; disallow another invocation
+                            if (!isBlocking())
+                                state = ST_CONNECTIONPENDING;
+                            else
+                                assert false;
+                        }
+                    }
+                    return false;
+                }
+            }
+        }
+
         InetSocketAddress isa = Net.checkAddress(sa);
         SecurityManager sm = System.getSecurityManager();
         if (sm != null)
@@ -755,6 +866,89 @@ class SocketChannelImpl
 
     @Override
     public boolean finishConnect() throws IOException {
+        if (PollsetSelectorFeature.ENABLED) {
+            synchronized (readLock) {
+                synchronized (writeLock) {
+                    synchronized (stateLock) {
+                        if (!isOpen())
+                            throw new ClosedChannelException();
+                        if (state == ST_CONNECTED)
+                            return true;
+                        if (state != ST_CONNECTIONPENDING)
+                            throw new NoConnectionPendingException();
+                    }
+                    int n = 0;
+                    try {
+                        try {
+                            begin();
+                            synchronized (blockingLock()) {
+                                synchronized (stateLock) {
+                                    if (!isOpen()) {
+                                        return false;
+                                    }
+                                    readerThread = NativeThread.current();
+                                }
+                                if (!isBlocking()) {
+                                    for (;;) {
+                                        n = checkConnectPollset(fd, false,
+                                                     readyToConnect);
+                                        if ((n == IOStatus.INTERRUPTED)
+                                              && isOpen())
+                                            continue;
+                                        break;
+                                    }
+                                } else {
+                                    for (;;) {
+                                        n = checkConnectPollset(fd, true,
+                                                     readyToConnect);
+                                        if (n == 0) {
+                                            // Loop in case of
+                                            // spurious notifications
+                                            continue;
+                                        }
+                                        if ((n == IOStatus.INTERRUPTED)
+                                              && isOpen())
+                                            continue;
+                                        break;
+                                    }
+                                }
+                            }
+                        } finally {
+                            synchronized (stateLock) {
+                                readerThread = 0;
+                                if (state == ST_KILLPENDING) {
+                                    kill();
+                                    // poll()/getsockopt() does not report
+                                    // error (throws exception, with n = 0)
+                                    // on Linux platform after dup2 and
+                                    // signal-wakeup. Force n to 0 so the
+                                    // end() can throw appropriate exception
+                                    n = 0;
+                                }
+                            }
+                            end((n > 0) || (n == IOStatus.UNAVAILABLE));
+                            assert IOStatus.check(n);
+                        }
+                    } catch (IOException x) {
+                        // If an exception was thrown, close the channel after
+                        // invoking end() so as to avoid bogus
+                        // AsynchronousCloseExceptions
+                        close();
+                        throw x;
+                    }
+                    if (n > 0) {
+                        synchronized (stateLock) {
+                            state = ST_CONNECTED;
+                            if (isOpen())
+                                localAddress = Net.localAddress(fd);
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+
         try {
             readLock.lock();
             try {
@@ -1009,6 +1203,49 @@ class SocketChannelImpl
      * Translates native poll revent ops into a ready operation ops
      */
     public boolean translateReadyOps(int ops, int initialOps, SelectionKeyImpl ski) {
+        if (PollsetSelectorFeature.ENABLED) {
+            int intOps = ski.nioInterestOps(); // Do this just once, it synchronizes
+            int oldOps = ski.nioReadyOps();
+            int newOps = initialOps;
+
+            if ((ops & Net.POLLNVAL) != 0) {
+                // This should only happen if this channel is pre-closed while a
+                // selection operation is in progress
+                // ## Throw an error if this channel has not been pre-closed
+                return false;
+            }
+
+            if ((ops & (Net.POLLERR | Net.POLLHUP)) != 0) {
+                newOps = intOps;
+                ski.nioReadyOps(newOps);
+                // No need to poll again in checkConnect,
+                // the error will be detected there
+                readyToConnect = true;
+                return (newOps & ~oldOps) != 0;
+            }
+
+            if (((ops & Net.POLLIN) != 0) &&
+                ((intOps & SelectionKey.OP_READ) != 0) &&
+                (state == ST_CONNECTED)) {
+                newOps |= SelectionKey.OP_READ;
+            }
+
+            if (((ops & Net.POLLCONN) != 0) &&
+                ((intOps & SelectionKey.OP_CONNECT) != 0)) {
+                newOps |= SelectionKey.OP_CONNECT;
+                readyToConnect = true;
+            }
+
+            if (((ops & Net.POLLOUT) != 0) &&
+                ((intOps & SelectionKey.OP_WRITE) != 0) &&
+                (state == ST_CONNECTED)) {
+                newOps |= SelectionKey.OP_WRITE;
+            }
+
+            ski.nioReadyOps(newOps);
+            return (newOps & ~oldOps) != 0;
+        }
+
         int intOps = ski.nioInterestOps();
         int oldOps = ski.nioReadyOps();
         int newOps = initialOps;
@@ -1112,10 +1349,30 @@ class SocketChannelImpl
         return sb.toString();
     }
 
+    /**
+     * This method is added to support the pollset implementation.
+     * Translates an interest operation set into a native poll event set.
+     */
+    @Override
+    public void translateAndSetInterestOps(int ops, SelectionKeyImpl sk) {
+        int newOps = 0;
+        if ((ops & SelectionKey.OP_READ) != 0)
+            newOps |= Net.POLLIN;
+        if ((ops & SelectionKey.OP_WRITE) != 0)
+            newOps |= Net.POLLOUT;
+        if ((ops & SelectionKey.OP_CONNECT) != 0)
+            newOps |= Net.POLLCONN;
+        ((SelectorImpl) sk.selector()).putEventOps(sk, newOps);
+    }
 
     // -- Native methods --
 
     private static native int checkConnect(FileDescriptor fd, boolean block)
+        throws IOException;
+
+    // This method is added to support the pollset implementation.
+    private static native int checkConnectPollset(FileDescriptor fd,
+                                           boolean block, boolean ready)
         throws IOException;
 
     private static native int sendOutOfBandData(FileDescriptor fd, byte data)
